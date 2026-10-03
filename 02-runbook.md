@@ -45,6 +45,36 @@ ktriage payments
 
 Output covers: pods not ready, pending, OOMKilled, unbound PVCs, deployments not available, services without endpoints, warning events, Istio objects, `istioctl analyze`, Helm releases. Anything red here sets the next section; if all clean, go to *Find the change*.
 
+## Triage levels: namespace → workload → pod
+
+Zoom in one level at a time. Each level answers a narrower question and names the next command.
+
+| Level | Command | Answers | You get |
+| --- | --- | --- | --- |
+| Cluster | `kscan` | which app namespaces have problems | per namespace: bad, pending, OOM, warnings, services without endpoints |
+| Namespace | `ktriage <ns>` | is anything in this namespace broken that Kubernetes/Istio already reports | unready/pending/OOM pods, unavailable deploys, empty services, warnings, Istio objects + analyze, Helm |
+| Workload | `kwork <deploy> <ns>` (or `sts/<name>`, `ds/<name>`) | is this service healthy as a whole; is the problem one pod, one node, one version | rollout status + conditions, images, revision, Helm release, every pod (ready, restarts, last exit, revision hash, version, node), spread per node and revision, resources + probes, HPA/PDB, Services and ready endpoints, warnings |
+| Pod | `kpod <pod> <ns>` | why this pod is unhealthy | phase, node, QoS, owner, conditions with reasons, each container's state + last exit code, resources + probes, pod events, app logs (previous container if restarted), sidecar access-log errors |
+
+**Reading `kwork`.**
+
+- Pods split across two revision hashes with only the new one failing → bad release; check `krhist` and the new image.
+- One node holds all failing pods → node problem; `knodes`, `kalloc`.
+- ready < desired and a PDB with `ALLOWED 0` → rollout blocked by the PDB.
+- A Service shows `2/6` ready endpoints → callers see `UH` / 503 under load.
+- Probe timeout 1 s on a slow endpoint → flapping readiness under load.
+
+**Reading `kpod`.**
+
+- `last exit: OOMKilled/exit 137` → memory limit; compare with `ktop` and the app's heap settings.
+- `last exit: Error/exit 1` → app crashed; the previous-container log above it shows why.
+- `WAITING=CrashLoopBackOff` with exit 0 → the process exits normally but shouldn't (missing config, wrong command).
+- `Ready=False (ContainersNotReady)` with the app running → readiness probe failing or `istio-proxy` not ready.
+- `PodScheduled=False` → go to `kpending` / `kalloc`.
+- Pod not found → it was replaced; `kkib <pod> <ns>` still has its logs.
+
+The order is the rule: never start at a pod without `kwork` first. A pod that looks broken is often one of six in the same state, which makes it a workload or dependency problem, not a pod problem.
+
 ## Find the change
 
 Check in this order — most likely cause first. Stop when one lines up with the first-error time.
@@ -78,7 +108,7 @@ Follow one request outside-in. At each hop ask: *did it arrive, did it leave?* T
 | Service → pods | `kepsvc <svc> <ns>`, `kbad <ns>` | app ns | no endpoints, pods not ready |
 | Sidecar | `isc-status <pod> <ns>`, `iaccess <pod> <ns>` | app ns | sidecar not ready, UF/UC flags |
 | App | `klogd <deploy> <ns> 30m`, `klogp <pod>`, `koom <ns>` | app ns | exceptions, crashes, OOM |
-| Downstream | app logs; `kyse <name> <ns>`, `knetpol <ns>` | app ns | connect timeouts, egress blocked |
+| Downstream | `kdeps <deploy> <ns>` (what it calls), app logs; `kyse <name> <ns>`, `knetpol <ns>` | app ns | connect timeouts, egress blocked |
 
 **Correlate one request end to end.** Take the `x-request-id` from the gateway access log, then:
 
@@ -244,7 +274,7 @@ Typical causes: new pods fail readiness (check `klogp`, `isc-status`), PDB `minA
 
 ## Command reference
 
-Every command in the profile, grouped by area. "Needs" is the permission beyond basic read; check yours with `kcan`. Full list in the shell: `khelp`. Log platform commands (`klq`, `kkib`, `kdd`, `ddsearch`, `kibsearch`, `kgo`, `klogkeys-clear`) are listed under *Kibana / Datadog handshake*.
+Every command in the profile, grouped by area. "Needs" is the permission beyond basic read; check yours with `kcan`. Full list in the shell: `khelp`. Workload and pod triage (`kwork`, `kpod`) are under *Triage levels*. Log platform commands (`klq`, `kkib`, `kdd`, `ddsearch`, `kibsearch`, `kgo`, `klogkeys-clear`) are listed under *Kibana / Datadog handshake*.
 
 | Area | Command | When | Where | Needs |
 | --- | --- | --- | --- | --- |

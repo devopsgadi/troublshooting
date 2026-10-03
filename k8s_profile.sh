@@ -747,6 +747,89 @@ kysvc() { ky service "$1" "$2"; }                                    # Service y
 kydep() { ky deployment "$1" "$2"; }                                 # Deployment yaml
 kycm()  { ky configmap "$1" "$2"; }                                  # ConfigMap yaml
 
+# ==== Workload / pod triage ====
+# per-container resources + probes (go-template body, used inside a range over containers)
+_K_RESPROBE='  {{.name}}:{{with .resources}}{{with .requests}} req cpu={{.cpu}} mem={{.memory}}{{end}}{{with .limits}} | lim cpu={{.cpu}} mem={{.memory}}{{end}}{{end}}{{"\n"}}{{with .readinessProbe}}    readiness:{{with .httpGet}} http {{.path}}:{{.port}}{{end}}{{with .tcpSocket}} tcp {{.port}}{{end}}{{with .exec}} exec{{end}} delay={{.initialDelaySeconds}} period={{.periodSeconds}} timeout={{.timeoutSeconds}} fail={{.failureThreshold}}{{"\n"}}{{end}}{{with .livenessProbe}}    liveness: {{with .httpGet}} http {{.path}}:{{.port}}{{end}}{{with .tcpSocket}} tcp {{.port}}{{end}}{{with .exec}} exec{{end}} delay={{.initialDelaySeconds}} period={{.periodSeconds}} timeout={{.timeoutSeconds}} fail={{.failureThreshold}}{{"\n"}}{{end}}{{with .startupProbe}}    startup:  {{with .httpGet}} http {{.path}}:{{.port}}{{end}}{{with .tcpSocket}} tcp {{.port}}{{end}}{{with .exec}} exec{{end}} period={{.periodSeconds}} fail={{.failureThreshold}}{{"\n"}}{{end}}'
+_K_CSTATE='ready={{.ready}} restarts={{.restartCount}}{{with .state.waiting}} WAITING={{.reason}}{{with .message}} ({{.}}){{end}}{{end}}{{with .state.running}} running since {{.startedAt}}{{end}}{{with .state.terminated}} TERMINATED={{.reason}}/exit {{.exitCode}}{{end}}{{with .lastState.terminated}} | last exit: {{.reason}}/exit {{.exitCode}} at {{.finishedAt}}{{end}}{{"\n"}}'
+
+kwork() { # workload-level triage: kwork <deploy|sts/name|ds/name> <ns>
+  local w="${1:?usage: kwork <deploy|sts/name|ds/name> <ns>}" n="${2:?usage: kwork <deploy|sts/name|ds/name> <ns>}" r sel pods
+  case "$w" in */*) r="$w" ;; *) r="deploy/$w" ;; esac
+  kubectl get "$r" -n "$n" >/dev/null || return 1
+  echo "== rollout ($r)"
+  kubectl get "$r" -n "$n" -o go-template='  desired={{.spec.replicas}} ready={{or .status.readyReplicas 0}} updated={{or .status.updatedReplicas 0}} available={{or .status.availableReplicas 0}} generation={{.metadata.generation}} observed={{.status.observedGeneration}}{{"\n"}}{{range .status.conditions}}  {{.type}}={{.status}} {{.reason}}: {{.message}}{{"\n"}}{{end}}'
+  echo "== images / release"
+  kubectl get "$r" -n "$n" -o go-template='{{range .spec.template.spec.containers}}  {{.name}}: {{.image}}{{"\n"}}{{end}}{{with .metadata.annotations}}  revision={{index . "deployment.kubernetes.io/revision"}} helm-release={{index . "meta.helm.sh/release-name"}}{{"\n"}}{{end}}{{with .metadata.labels}}  chart={{index . "helm.sh/chart"}}{{"\n"}}{{end}}' | sed 's/<no value>/-/g'
+  sel=$(kubectl get "$r" -n "$n" -o go-template='{{range $k,$v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}'); sel="${sel%,}"
+  echo "== pods ($sel)"
+  kubectl get pods -n "$n" -l "$sel" -o custom-columns='POD:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,RESTARTS:.status.containerStatuses[*].restartCount,LAST_EXIT:.status.containerStatuses[*].lastState.terminated.reason,REV:.metadata.labels.pod-template-hash,VERSION:.metadata.labels.version,NODE:.spec.nodeName,STARTED:.status.startTime'
+  echo "== spread"
+  kubectl get pods -n "$n" -l "$sel" -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort | uniq -c | sed 's/^ */  node: /'
+  kubectl get pods -n "$n" -l "$sel" -o jsonpath='{range .items[*]}{.metadata.labels.pod-template-hash}{.metadata.labels.controller-revision-hash}{"\n"}{end}' | sort | uniq -c | sed 's/^ */  revision: /'
+  echo "== resources / probes"
+  kubectl get "$r" -n "$n" -o go-template="{{range .spec.template.spec.containers}}$_K_RESPROBE{{end}}" | sed 's/<no value>/-/g'
+  echo "== HPA / PDB"
+  kubectl get hpa -n "$n" -o custom-columns='HPA:.metadata.name,TARGET:.spec.scaleTargetRef.name,MIN:.spec.minReplicas,MAX:.spec.maxReplicas,CURRENT:.status.currentReplicas,DESIRED:.status.desiredReplicas' 2>/dev/null | awk -v t="${r#*/}" 'NR==1 || $2==t'
+  kubectl get pdb -n "$n" -o custom-columns='PDB:.metadata.name,MIN_AVAIL:.spec.minAvailable,MAX_UNAVAIL:.spec.maxUnavailable,ALLOWED:.status.disruptionsAllowed,SELECTOR:.spec.selector.matchLabels' 2>/dev/null
+  echo "== services routing to these pods (ready endpoints / total)"
+  pods=" $(kubectl get pods -n "$n" -l "$sel" -o jsonpath='{.items[*].metadata.name}') "
+  kubectl get endpointslices -n "$n" -o go-template='{{range .items}}{{$s := index .metadata.labels "kubernetes.io/service-name"}}{{range .endpoints}}{{if .targetRef}}{{$s}} {{.targetRef.name}} {{with .conditions}}{{.ready}}{{end}}{{"\n"}}{{end}}{{end}}{{end}}' 2>/dev/null \
+    | awk -v pods="$pods" 'index(pods," "$2" ") {t[$1]++; if ($3=="true") r[$1]++} END {for (s in t) printf "  %s %d/%d\n", s, r[s], t[s]}'
+  echo "== warning events for this workload"
+  kubectl get events -n "$n" --field-selector type=Warning --sort-by=.lastTimestamp --no-headers 2>/dev/null | grep -F "${r#*/}" | tail -n 15
+  echo "== next: kpod <pod> $n | iaccess <pod> $n | kdeps ${r#*/} $n | kdd $r $n 1h error"
+}
+
+kpod() { # pod-level triage: kpod <pod> <ns>
+  local p="${1:?usage: kpod <pod> <ns>}" n="${2:?usage: kpod <pod> <ns>}" app rs
+  kubectl get pod "$p" -n "$n" >/dev/null 2>&1 || { echo "pod $p not found in $n (restarted/rolled?) — kgo <cluster> $n $p, or kkib $p $n for its history"; return 1; }
+  echo "== pod"
+  kubectl get pod "$p" -n "$n" -o go-template='  phase={{.status.phase}} node={{.spec.nodeName}} ip={{.status.podIP}} qos={{.status.qosClass}} started={{.status.startTime}}{{"\n"}}  owner={{range .metadata.ownerReferences}}{{.kind}}/{{.name}}{{end}} serviceAccount={{.spec.serviceAccountName}}{{"\n"}}'
+  echo "== conditions"
+  kubectl get pod "$p" -n "$n" -o go-template='{{range .status.conditions}}  {{.type}}={{.status}}{{with .reason}} ({{.}}){{end}}{{with .message}}: {{.}}{{end}}{{"\n"}}{{end}}'
+  echo "== containers"
+  kubectl get pod "$p" -n "$n" -o go-template="{{range .status.initContainerStatuses}}  init {{.name}}: $_K_CSTATE{{end}}{{range .status.containerStatuses}}  {{.name}}: $_K_CSTATE{{end}}"
+  echo "  (exit 137 = killed/OOM, 143 = SIGTERM, 1 = app error, 126/127 = bad command, 0 = exited normally)"
+  echo "== resources / probes"
+  kubectl get pod "$p" -n "$n" -o go-template="{{range .spec.containers}}$_K_RESPROBE{{end}}" | sed 's/<no value>/-/g'
+  echo "== events"
+  kubectl get events -n "$n" --field-selector involvedObject.name="$p" --sort-by=.lastTimestamp 2>/dev/null | tail -n 15
+  app=$(kubectl get pod "$p" -n "$n" -o jsonpath='{.spec.containers[*].name}' | tr ' ' '\n' | grep -vx istio-proxy | head -1)
+  rs=$(kubectl get pod "$p" -n "$n" -o jsonpath="{.status.containerStatuses[?(@.name==\"$app\")].restartCount}")
+  if [ "${rs:-0}" -gt 0 ]; then
+    echo "== logs: $app PREVIOUS container (before last restart), last 25 lines"
+    kubectl logs "$p" -n "$n" -c "$app" --previous --tail=25 2>&1
+  fi
+  echo "== logs: $app current, last 25 lines"
+  kubectl logs "$p" -n "$n" -c "$app" --tail=25 2>&1
+  if kubectl get pod "$p" -n "$n" -o jsonpath='{.spec.containers[*].name} {.spec.initContainers[*].name}' | grep -qw istio-proxy; then
+    echo "== sidecar access-log errors (30m)"; iaccess "$p" "$n" 30m
+  else
+    echo "== no istio-proxy sidecar on this pod"
+  fi
+  echo "== next: klq $p $n | kkib $p $n | isc-status $p $n | kchain <svc> $n"
+}
+
+kdeps() { # outbound dependencies of a workload, read from its config: kdeps <deploy> <ns>
+  local d="${1:?usage: kdeps <deploy> <ns>}" n="${2:?usage: kdeps <deploy> <ns>}" cm cms
+  local re='https?://[^" ,;]+|[a-z0-9-]+(\.[a-z0-9-]+)*\.svc(\.cluster\.local)?(:[0-9]+)?|[a-z0-9][a-z0-9.-]*\.[a-z]{2,}:[0-9]{2,5}'
+  echo "== env vars that look like endpoints ($d)"
+  kubectl get deploy "$d" -n "$n" -o go-template='{{range .spec.template.spec.containers}}{{range .env}}{{if .value}}{{.name}}={{.value}}{{"\n"}}{{end}}{{end}}{{end}}' \
+    | grep -iE '^[^=]*(url|uri|host|endpoint|addr|server|broker|bootstrap|dsn|service)[^=]*=' || echo "  (none)"
+  echo "== env from secrets (names only — values need secret read)"
+  kubectl get deploy "$d" -n "$n" -o go-template='{{range .spec.template.spec.containers}}{{range .env}}{{if .valueFrom}}{{if .valueFrom.secretKeyRef}}{{.name}} <- secret/{{.valueFrom.secretKeyRef.name}}:{{.valueFrom.secretKeyRef.key}}{{"\n"}}{{end}}{{end}}{{end}}{{end}}' \
+    | grep -iE '(url|uri|host|endpoint|dsn|conn|broker)' || echo "  (none)"
+  cms=$(kubectl get deploy "$d" -n "$n" -o jsonpath='{.spec.template.spec.containers[*].envFrom[*].configMapRef.name} {.spec.template.spec.volumes[*].configMap.name}')
+  for cm in $(printf '%s\n' $cms | sort -u); do
+    echo "== hosts in configmap/$cm"
+    kubectl get cm "$cm" -n "$n" -o go-template='{{range $k,$v := .data}}{{$v}}{{"\n"}}{{end}}' 2>/dev/null | grep -oiE "$re" | sort -u | sed 's/^/  /'
+  done
+  echo "== ServiceEntries (external deps registered in mesh) in $n"
+  kubectl get serviceentries.networking.istio.io -n "$n" -o custom-columns='NAME:.metadata.name,HOSTS:.spec.hosts,PORTS:.spec.ports[*].number,RESOLUTION:.spec.resolution' 2>/dev/null
+  echo "== Sidecar egress scope in $n (if set, calls outside it fail with 404/NR)"
+  kubectl get sidecars.networking.istio.io -n "$n" -o custom-columns='NAME:.metadata.name,EGRESS:.spec.egress[*].hosts' 2>/dev/null
+}
+
 kchain() { # full path for a service: VS -> Service -> DR -> pods/owners -> endpoints: kchain <svc> <ns>
   local s="${1:?usage: kchain <svc> <ns>}" n="${2:?usage: kchain <svc> <ns>}" sel v
   local m='{for(i=3;i<=NF;i++){h=$i; if((h==s && $1==n)||h==s"."n||h==s"."n".svc"||h==s"."n".svc.cluster.local"){print $1" "$2; break}}}'
